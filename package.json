@@ -1,7 +1,7 @@
 {
   "name": "devns",
   "version": "1.0.0",
-  "description": "Lightweight UDP DNS resolver proxy using Node.js built-in dns and dns-packet",
+  "description": "Lightweight UDP/TCP DNS resolver proxy using Node.js built-in dns and dns-packet",
   "bin": {
     "devns": "dist/index.js"
   },

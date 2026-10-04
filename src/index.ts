@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import dgram from 'node:dgram';
+import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promises as dns } from 'node:dns';
+import { CustomRecord, DEFAULT_RECORDS_PATH, RecordStore, RecordType, parseValue } from './records';
+import { startWebServer } from './web';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const packet: any = require('dns-packet');
 
@@ -13,13 +16,26 @@ interface ServerOptions {
     host: string;
     port: number;
     ttl: number;
+    web: boolean;
+    webHost: string;
+    webPort: number;
+    open: boolean;
+    records: string;
 }
 
 const DEFAULTS: ServerOptions = {
     host: process.env.DNS_HOST || '0.0.0.0',
     port: Number(process.env.DNS_PORT || 53),
     ttl: Number(process.env.DNS_TTL || 300),
+    web: process.env.DEVNS_WEB !== '0',
+    webHost: process.env.DEVNS_WEB_HOST || '127.0.0.1',
+    webPort: Number(process.env.DEVNS_WEB_PORT || 5380),
+    open: process.env.DEVNS_OPEN !== '0',
+    records: process.env.DEVNS_RECORDS || DEFAULT_RECORDS_PATH,
 };
+
+let store = new RecordStore(DEFAULTS.records);
+let effectiveTtl = DEFAULTS.ttl;
 
 const parseArgs = (): Partial<ServerOptions> => {
     const args = process.argv.slice(2);
@@ -35,10 +51,23 @@ const parseArgs = (): Partial<ServerOptions> => {
         } else if (a === '--ttl') {
             const v = args[++i];
             if (v) opts.ttl = Number(v);
+        } else if (a === '--web-port') {
+            const v = args[++i];
+            if (v) opts.webPort = Number(v);
+        } else if (a === '--web-host') {
+            const v = args[++i];
+            if (v) opts.webHost = v;
+        } else if (a === '--records') {
+            const v = args[++i];
+            if (v) opts.records = v;
+        } else if (a === '--no-web') {
+            opts.web = false;
+        } else if (a === '--no-open') {
+            opts.open = false;
         } else if (a === '--help' || a === '-h') {
             // eslint-disable-next-line no-console
             console.log(
-                `dns-server - Lightweight UDP DNS resolver\n\nUsage: dns-server [options]\n\nOptions:\n  -p, --port <port>   UDP port to listen on (default: 53)\n  -H, --host <host>   Host/IP to bind (default: 0.0.0.0)\n  --ttl <seconds>     TTL for synthesized answers (default: 300)\n  -h, --help          Show help`,
+                `devns - Lightweight DNS resolver with a web UI\n\nUsage: devns [options]\n\nOptions:\n  -p, --port <port>       UDP/TCP port to listen on (default: 53)\n  -H, --host <host>       Host/IP to bind (default: 0.0.0.0)\n  --ttl <seconds>         TTL for synthesized answers (default: 300)\n  --web-port <port>       Web UI port (default: 5380)\n  --web-host <host>       Web UI bind host (default: 127.0.0.1)\n  --records <path>        Records JSON file (default: ~/.devns/records.json)\n  --no-web                Disable the web UI\n  --no-open               Do not open the browser automatically\n  -h, --help              Show help`,
             );
             process.exit(0);
         }
@@ -206,8 +235,84 @@ const lookupFromHosts = (qname: string, type: QType, ttl: number): any[] | null 
     return null;
 };
 
+// -------------------- Custom records (web UI) --------------------
+const MAX_UDP_PAYLOAD = 4096;
+const MIN_UDP_PAYLOAD = 512;
+
+/** Split a TXT value into DNS character-strings of at most 255 bytes (UTF-8 safe). */
+const splitTxt = (value: string, max = 255): string[] => {
+    const chunks: string[] = [];
+    let current = '';
+    let bytes = 0;
+    for (const char of value) {
+        const size = Buffer.byteLength(char);
+        if (bytes + size > max && current) {
+            chunks.push(current);
+            current = '';
+            bytes = 0;
+        }
+        current += char;
+        bytes += size;
+    }
+    chunks.push(current);
+    return chunks;
+};
+
+const buildCustomAnswers = (records: CustomRecord[], qname: string, ttl: number): any[] =>
+    records
+        .map((rec) => {
+            const recTtl = rec.ttl ?? ttl;
+            switch (rec.type) {
+                case 'A':
+                case 'AAAA':
+                case 'CNAME':
+                case 'NS':
+                case 'PTR':
+                    return { type: rec.type, name: qname, ttl: recTtl, data: rec.value };
+                case 'MX': {
+                    const fields = parseValue('MX', rec.value);
+                    if (!fields.target) return null;
+                    return {
+                        type: 'MX',
+                        name: qname,
+                        ttl: recTtl,
+                        data: { preference: Number(fields.priority) || 0, exchange: fields.target },
+                    };
+                }
+                case 'SRV': {
+                    const fields = parseValue('SRV', rec.value);
+                    if (!fields.target) return null;
+                    return {
+                        type: 'SRV',
+                        name: qname,
+                        ttl: recTtl,
+                        data: {
+                            priority: Number(fields.priority) || 0,
+                            weight: Number(fields.weight) || 0,
+                            port: Number(fields.port) || 0,
+                            target: fields.target,
+                        },
+                    };
+                }
+                case 'TXT':
+                    return { type: 'TXT', name: qname, ttl: recTtl, data: splitTxt(rec.value) };
+                default:
+                    return null;
+            }
+        })
+        .filter((answer): answer is any => answer !== null);
+
+const lookupFromCustom = (qname: string, type: QType, ttl: number): any[] | null => {
+    // Pick up edits made directly to the records file.
+    store.reloadIfChanged();
+    const found = store.lookup(qname, type === 'ANY' ? 'ANY' : (type as RecordType));
+    if (!found.length) return null;
+    const answers = buildCustomAnswers(found, qname, ttl);
+    return answers.length ? answers : null;
+};
+
 const mapResolve = async (name: string, type: QType): Promise<any[]> => {
-    const ttl = DEFAULTS.ttl;
+    const ttl = effectiveTtl;
     const answers: any[] = [];
 
     const add = (ans: any | any[]) => {
@@ -216,11 +321,15 @@ const mapResolve = async (name: string, type: QType): Promise<any[]> => {
     };
 
     try {
-        // 1) Hosts override
+        // 1) User-defined records take precedence
+        const customAns = lookupFromCustom(name, type, ttl);
+        if (customAns) return customAns;
+
+        // 2) Hosts override
         const hostsAns = lookupFromHosts(name, type, ttl);
         if (hostsAns) return hostsAns;
 
-        // 2) System resolver
+        // 3) System resolver
         switch (type) {
             case 'A': {
                 const ips = (await dns.resolve4(name)).slice(0, 20);
@@ -310,85 +419,128 @@ const mapResolve = async (name: string, type: QType): Promise<any[]> => {
     }
 };
 
+/**
+ * Decode, resolve and encode a single DNS query. Shared by the UDP and TCP listeners.
+ * Returns `null` when the message can't be decoded or carries no question.
+ */
+const handleQuery = async (msg: Buffer, transport: 'udp' | 'tcp', peer: string): Promise<Buffer | null> => {
+    let req: any;
+    try {
+        req = packet.decode(msg);
+    } catch (e: any) {
+        console.warn(`[DNS Server] Failed to decode DNS packet from ${peer} - ${e.message}`);
+        return null;
+    }
+
+    const q = req.questions?.[0];
+    if (!q) return null;
+
+    const qname = q.name;
+    const qtype = toRecordType(q.type as QType);
+
+    console.log(`[DNS Server] Query id=${req.id} ${qtype} ${qname} from ${peer} (${transport})`);
+
+    const baseResp: any = {
+        id: req.id,
+        type: 'response',
+        flags: req.flags ?? 0,
+        questions: req.questions,
+        answers: [],
+        additionals: [],
+        authorities: [],
+    };
+
+    // Honor EDNS(0): use the client's advertised UDP payload size when present.
+    const reqOpt = Array.isArray(req.additionals)
+        ? req.additionals.find((a: any) => a && String(a.type).toUpperCase() === 'OPT')
+        : undefined;
+    const advertisedSize = reqOpt ? Number(reqOpt.udpPayloadSize) : 0;
+    // TCP messages are length-prefixed with 16 bits, so the limit is 65535.
+    const maxSize =
+        transport === 'tcp'
+            ? 0xffff
+            : advertisedSize >= MIN_UDP_PAYLOAD
+              ? Math.min(advertisedSize, MAX_UDP_PAYLOAD)
+              : MIN_UDP_PAYLOAD;
+
+    // Set header flags: QR=1, RA=1, RD copied
+    const RD = (req.flags || 0) & packet.RECURSION_DESIRED ? packet.RECURSION_DESIRED : 0;
+    let flags = packet.RESPONSE | RD | packet.RECURSION_AVAILABLE;
+
+    try {
+        const answers = await mapResolve(qname, qtype);
+        baseResp.answers = answers;
+        flags |= 0; // NOERROR
+    } catch (e: any) {
+        const code = e?.code as string | undefined;
+        let rcode: number = RCODE.NOERROR;
+        if (code === 'ENODATA' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+            rcode = RCODE.NXDOMAIN;
+        } else if (code === 'NOTIMP') {
+            rcode = RCODE.NOTIMP;
+        } else {
+            rcode = RCODE.SERVFAIL;
+        }
+        flags |= rcode;
+        console.warn(`[DNS Server] Resolution failed for ${qtype} ${qname}: ${e?.message || e} (${code})`);
+    }
+
+    baseResp.flags = flags;
+
+    // Advertise EDNS(0) back when the client used it, so large answers fit in UDP.
+    if (reqOpt) {
+        baseResp.additionals = [
+            {
+                name: '.',
+                type: 'OPT',
+                udpPayloadSize: transport === 'tcp' ? MAX_UDP_PAYLOAD : Math.max(maxSize, MIN_UDP_PAYLOAD),
+                extendedRcode: 0,
+                ednsVersion: 0,
+                flags: 0,
+                options: [],
+            },
+        ];
+    }
+
+    let buf = packet.encode(baseResp);
+    // UDP only: truncate (and set TC) when the response exceeds the negotiated size.
+    if (transport === 'udp' && buf.length > maxSize) {
+        baseResp.flags = (baseResp.flags || 0) | packet.TRUNCATED_RESPONSE;
+        // naive truncation: drop answers until it fits
+        while (baseResp.answers && baseResp.answers.length && packet.encode(baseResp).length > maxSize) {
+            baseResp.answers.pop();
+        }
+        buf = packet.encode(baseResp);
+    }
+    return buf;
+};
+
 const start = async () => {
     const override = parseArgs();
     const opts: ServerOptions = { ...DEFAULTS, ...override } as ServerOptions;
+    if (opts.records !== store.file) store = new RecordStore(opts.records);
+    effectiveTtl = opts.ttl;
     const isIPv6 = opts.host.includes(':');
     const sock = dgram.createSocket(isIPv6 ? 'udp6' : 'udp4');
+    const tcpServer = net.createServer();
+    let webServer: ReturnType<typeof startWebServer> | null = null;
 
     sock.on('error', (err) => {
         console.error(`[DNS Server] Socket error: ${err.message}`);
     });
 
-    sock.on('message', async (msg, rinfo) => {
-        let req: any;
-        try {
-            req = packet.decode(msg);
-        } catch (e: any) {
-            console.warn(`[DNS Server] Failed to decode DNS packet from ${rinfo.address}:${rinfo.port} - ${e.message}`);
-            return;
-        }
-
-        const q = req.questions?.[0];
-        if (!q) {
-            return;
-        }
-
-        const qname = q.name;
-        const qtype = toRecordType(q.type as QType);
-
-        console.log(`[DNS Server] Query id=${req.id} ${qtype} ${qname} from ${rinfo.address}:${rinfo.port}`);
-
-        const baseResp: any = {
-            id: req.id,
-            type: 'response',
-            flags: req.flags ?? 0,
-            questions: req.questions,
-            answers: [],
-            additionals: [],
-            authorities: [],
-        };
-
-        // Set header flags: QR=1, RA=1, RD copied
-        const RD = (req.flags || 0) & packet.RECURSION_DESIRED ? packet.RECURSION_DESIRED : 0;
-        let flags = packet.RESPONSE | RD | packet.RECURSION_AVAILABLE;
-
-        try {
-            const answers = await mapResolve(qname, qtype);
-            baseResp.answers = answers;
-            flags |= 0; // NOERROR
-        } catch (e: any) {
-            const code = e?.code as string | undefined;
-            let rcode: number = RCODE.NOERROR;
-            if (code === 'ENODATA' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
-                rcode = RCODE.NXDOMAIN;
-            } else if (code === 'NOTIMP') {
-                rcode = RCODE.NOTIMP;
-            } else {
-                rcode = RCODE.SERVFAIL;
-            }
-            flags |= rcode;
-            console.warn(`[DNS Server] Resolution failed for ${qtype} ${qname}: ${e?.message || e} (${code})`);
-        }
-
-        baseResp.flags = flags;
-
-        let buf = packet.encode(baseResp);
-        // Truncate if exceeds 512 bytes (no EDNS support)
-        if (buf.length > 512) {
-            baseResp.flags = (baseResp.flags || 0) | packet.TRUNCATED_RESPONSE;
-            // naive truncation: drop answers until fits
-            while (baseResp.answers && baseResp.answers.length && packet.encode(baseResp).length > 512) {
-                baseResp.answers.pop();
-            }
-            buf = packet.encode(baseResp);
-        }
-
-        sock.send(buf, rinfo.port, rinfo.address, (err) => {
-            if (err) {
-                console.error(`[DNS Server] Failed to send DNS response: ${err.message}`);
-            }
-        });
+    sock.on('message', (msg, rinfo) => {
+        const peer = `${rinfo.address}:${rinfo.port}`;
+        handleQuery(msg, 'udp', peer)
+            .then((buf) => {
+                if (!buf) return;
+                sock.send(buf, rinfo.port, rinfo.address, (err) => {
+                    if (err) {
+                        console.error(`[DNS Server] Failed to send DNS response: ${err.message}`);
+                    }
+                });
+            })
+            .catch((e) => console.error(`[DNS Server] Failed to handle query from ${peer}: ${e?.message || e}`));
     });
 
     sock.on('listening', () => {
@@ -397,14 +549,81 @@ const start = async () => {
         console.log(`[DNS Server] Listening on udp://${bind}`);
     });
 
+    // DNS over TCP (RFC 7766): 2-byte big-endian length prefix. Clients fall back
+    // to TCP for large answers that don't fit in UDP, e.g. long TXT/DKIM records.
+    tcpServer.on('connection', (socket) => {
+        const peer = `${socket.remoteAddress}:${socket.remotePort}`;
+        let buffer = Buffer.alloc(0);
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            while (buffer.length >= 2) {
+                const length = buffer.readUInt16BE(0);
+                if (buffer.length < 2 + length) break;
+                const message = buffer.subarray(2, 2 + length);
+                buffer = buffer.subarray(2 + length);
+                handleQuery(message, 'tcp', peer)
+                    .then((resp) => {
+                        if (!resp || resp.length > 0xffff) return;
+                        const framed = Buffer.allocUnsafe(2 + resp.length);
+                        framed.writeUInt16BE(resp.length, 0);
+                        resp.copy(framed, 2);
+                        socket.write(framed);
+                    })
+                    .catch((e) => console.error(`[DNS Server] TCP query error from ${peer}: ${e?.message || e}`));
+            }
+        });
+        socket.on('error', (err) => {
+            console.error(`[DNS Server] TCP socket error from ${peer}: ${err.message}`);
+        });
+    });
+
+    tcpServer.on('listening', () => {
+        console.log(`[DNS Server] Listening on tcp://${opts.host}:${opts.port}`);
+    });
+
     process.on('SIGINT', () => {
         console.log('[DNS Server] Shutting down...');
+        if (webServer) webServer.close();
+        tcpServer.close();
         sock.close(() => process.exit(0));
     });
 
     // Load hosts once and start a watcher
     await loadHosts();
     watchHosts();
+
+    // Load user-defined records and serve the web UI
+    store.load();
+    console.log(`[DevNS] Records file: ${store.file} (${store.get().length} records)`);
+    if (opts.web) {
+        webServer = startWebServer(
+            { store, dnsHost: opts.host, dnsPort: opts.port },
+            { host: opts.webHost, port: opts.webPort, open: opts.open },
+        );
+    }
+
+    let tcpRetrying = false;
+    const attemptTcpBind = () => {
+        tcpServer.listen(opts.port, opts.host);
+    };
+
+    tcpServer.on('error', (err: any) => {
+        const code = err?.code;
+        if (code === 'EACCES') {
+            console.error(`[DNS Server] TCP permission denied binding to ${opts.host}:${opts.port}. You can use --port 1053 for testing. Will retry in 5s...`);
+        } else if (code === 'EADDRINUSE') {
+            console.error(`[DNS Server] TCP port ${opts.port} already in use on ${opts.host}. Will retry in 5s...`);
+        } else {
+            console.error(`[DNS Server] TCP server error: ${err?.message || err}`);
+        }
+        if (!tcpServer.listening && !tcpRetrying) {
+            tcpRetrying = true;
+            setTimeout(() => {
+                tcpRetrying = false;
+                attemptTcpBind();
+            }, 5000);
+        }
+    });
 
     const attemptBind = () => {
         try {
@@ -423,6 +642,7 @@ const start = async () => {
     };
 
     attemptBind();
+    attemptTcpBind();
 };
 
 // Do not exit the process on error; keep the dev process alive
