@@ -102,6 +102,16 @@ npm run build
 npm start -- --port 1053
 ```
 
+### Testing
+
+The unit tests use the built-in Node.js test runner (via `tsx`) and cover the
+record store, hosts import, TXT character-string splitting, EDNS(0)
+negotiation, UDP truncation and DNS-over-TCP framing:
+
+```bash
+npm test
+```
+
 ## Supported DNS Record Types
 
 The server supports the following DNS query types:

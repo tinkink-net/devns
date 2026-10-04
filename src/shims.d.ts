@@ -2,8 +2,7 @@ declare module 'dns-packet' {
     export const RECURSION_DESIRED: number;
     export const RECURSION_AVAILABLE: number;
     export const TRUNCATED_RESPONSE: number;
-    export const RESPONSE: number;
-    export const RCODE_NAME_TO_VALUE: Record<string, number>;
+    export const AUTHORITATIVE_ANSWER: number;
 
     export interface DNSQuestion {
         type: any;
@@ -34,8 +33,7 @@ declare module 'dns-packet' {
         RECURSION_DESIRED: number;
         RECURSION_AVAILABLE: number;
         TRUNCATED_RESPONSE: number;
-        RESPONSE: number;
-        RCODE_NAME_TO_VALUE: Record<string, number>;
+        AUTHORITATIVE_ANSWER: number;
     };
     export default packet;
 }

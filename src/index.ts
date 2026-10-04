@@ -5,7 +5,8 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promises as dns } from 'node:dns';
-import { CustomRecord, DEFAULT_RECORDS_PATH, RecordStore, RecordType, parseValue } from './records';
+import { DEFAULT_RECORDS_PATH, RecordStore, RecordType } from './records';
+import { RCODE, buildCustomAnswers, buildResponse, extractTcpMessages, frameTcpResponse } from './dns';
 import { startWebServer } from './web';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const packet: any = require('dns-packet');
@@ -78,15 +79,6 @@ const parseArgs = (): Partial<ServerOptions> => {
 const toRecordType = (t: QType): QType => t;
 
 // -------------------- Hosts file support --------------------
-const RCODE = {
-    NOERROR: 0,
-    FORMERR: 1,
-    SERVFAIL: 2,
-    NXDOMAIN: 3,
-    NOTIMP: 4,
-    REFUSED: 5,
-} as const;
-
 type HostsCache = {
     v4: Map<string, string[]>; // hostname -> IPv4 list
     v6: Map<string, string[]>; // hostname -> IPv6 list
@@ -236,72 +228,6 @@ const lookupFromHosts = (qname: string, type: QType, ttl: number): any[] | null 
 };
 
 // -------------------- Custom records (web UI) --------------------
-const MAX_UDP_PAYLOAD = 4096;
-const MIN_UDP_PAYLOAD = 512;
-
-/** Split a TXT value into DNS character-strings of at most 255 bytes (UTF-8 safe). */
-const splitTxt = (value: string, max = 255): string[] => {
-    const chunks: string[] = [];
-    let current = '';
-    let bytes = 0;
-    for (const char of value) {
-        const size = Buffer.byteLength(char);
-        if (bytes + size > max && current) {
-            chunks.push(current);
-            current = '';
-            bytes = 0;
-        }
-        current += char;
-        bytes += size;
-    }
-    chunks.push(current);
-    return chunks;
-};
-
-const buildCustomAnswers = (records: CustomRecord[], qname: string, ttl: number): any[] =>
-    records
-        .map((rec) => {
-            const recTtl = rec.ttl ?? ttl;
-            switch (rec.type) {
-                case 'A':
-                case 'AAAA':
-                case 'CNAME':
-                case 'NS':
-                case 'PTR':
-                    return { type: rec.type, name: qname, ttl: recTtl, data: rec.value };
-                case 'MX': {
-                    const fields = parseValue('MX', rec.value);
-                    if (!fields.target) return null;
-                    return {
-                        type: 'MX',
-                        name: qname,
-                        ttl: recTtl,
-                        data: { preference: Number(fields.priority) || 0, exchange: fields.target },
-                    };
-                }
-                case 'SRV': {
-                    const fields = parseValue('SRV', rec.value);
-                    if (!fields.target) return null;
-                    return {
-                        type: 'SRV',
-                        name: qname,
-                        ttl: recTtl,
-                        data: {
-                            priority: Number(fields.priority) || 0,
-                            weight: Number(fields.weight) || 0,
-                            port: Number(fields.port) || 0,
-                            target: fields.target,
-                        },
-                    };
-                }
-                case 'TXT':
-                    return { type: 'TXT', name: qname, ttl: recTtl, data: splitTxt(rec.value) };
-                default:
-                    return null;
-            }
-        })
-        .filter((answer): answer is any => answer !== null);
-
 const lookupFromCustom = (qname: string, type: QType, ttl: number): any[] | null => {
     // Pick up edits made directly to the records file.
     store.reloadIfChanged();
@@ -440,40 +366,12 @@ const handleQuery = async (msg: Buffer, transport: 'udp' | 'tcp', peer: string):
 
     console.log(`[DNS Server] Query id=${req.id} ${qtype} ${qname} from ${peer} (${transport})`);
 
-    const baseResp: any = {
-        id: req.id,
-        type: 'response',
-        flags: req.flags ?? 0,
-        questions: req.questions,
-        answers: [],
-        additionals: [],
-        authorities: [],
-    };
-
-    // Honor EDNS(0): use the client's advertised UDP payload size when present.
-    const reqOpt = Array.isArray(req.additionals)
-        ? req.additionals.find((a: any) => a && String(a.type).toUpperCase() === 'OPT')
-        : undefined;
-    const advertisedSize = reqOpt ? Number(reqOpt.udpPayloadSize) : 0;
-    // TCP messages are length-prefixed with 16 bits, so the limit is 65535.
-    const maxSize =
-        transport === 'tcp'
-            ? 0xffff
-            : advertisedSize >= MIN_UDP_PAYLOAD
-              ? Math.min(advertisedSize, MAX_UDP_PAYLOAD)
-              : MIN_UDP_PAYLOAD;
-
-    // Set header flags: QR=1, RA=1, RD copied
-    const RD = (req.flags || 0) & packet.RECURSION_DESIRED ? packet.RECURSION_DESIRED : 0;
-    let flags = packet.RESPONSE | RD | packet.RECURSION_AVAILABLE;
-
+    let answers: any[] = [];
+    let rcode: number = RCODE.NOERROR;
     try {
-        const answers = await mapResolve(qname, qtype);
-        baseResp.answers = answers;
-        flags |= 0; // NOERROR
+        answers = await mapResolve(qname, qtype);
     } catch (e: any) {
         const code = e?.code as string | undefined;
-        let rcode: number = RCODE.NOERROR;
         if (code === 'ENODATA' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
             rcode = RCODE.NXDOMAIN;
         } else if (code === 'NOTIMP') {
@@ -481,38 +379,10 @@ const handleQuery = async (msg: Buffer, transport: 'udp' | 'tcp', peer: string):
         } else {
             rcode = RCODE.SERVFAIL;
         }
-        flags |= rcode;
         console.warn(`[DNS Server] Resolution failed for ${qtype} ${qname}: ${e?.message || e} (${code})`);
     }
 
-    baseResp.flags = flags;
-
-    // Advertise EDNS(0) back when the client used it, so large answers fit in UDP.
-    if (reqOpt) {
-        baseResp.additionals = [
-            {
-                name: '.',
-                type: 'OPT',
-                udpPayloadSize: transport === 'tcp' ? MAX_UDP_PAYLOAD : Math.max(maxSize, MIN_UDP_PAYLOAD),
-                extendedRcode: 0,
-                ednsVersion: 0,
-                flags: 0,
-                options: [],
-            },
-        ];
-    }
-
-    let buf = packet.encode(baseResp);
-    // UDP only: truncate (and set TC) when the response exceeds the negotiated size.
-    if (transport === 'udp' && buf.length > maxSize) {
-        baseResp.flags = (baseResp.flags || 0) | packet.TRUNCATED_RESPONSE;
-        // naive truncation: drop answers until it fits
-        while (baseResp.answers && baseResp.answers.length && packet.encode(baseResp).length > maxSize) {
-            baseResp.answers.pop();
-        }
-        buf = packet.encode(baseResp);
-    }
-    return buf;
+    return buildResponse(req, answers, { transport, rcode });
 };
 
 const start = async () => {
@@ -553,21 +423,16 @@ const start = async () => {
     // to TCP for large answers that don't fit in UDP, e.g. long TXT/DKIM records.
     tcpServer.on('connection', (socket) => {
         const peer = `${socket.remoteAddress}:${socket.remotePort}`;
-        let buffer = Buffer.alloc(0);
+        let buffer: Buffer = Buffer.alloc(0);
         socket.on('data', (chunk) => {
             buffer = Buffer.concat([buffer, chunk]);
-            while (buffer.length >= 2) {
-                const length = buffer.readUInt16BE(0);
-                if (buffer.length < 2 + length) break;
-                const message = buffer.subarray(2, 2 + length);
-                buffer = buffer.subarray(2 + length);
+            const { messages, rest } = extractTcpMessages(buffer);
+            buffer = rest;
+            for (const message of messages) {
                 handleQuery(message, 'tcp', peer)
                     .then((resp) => {
                         if (!resp || resp.length > 0xffff) return;
-                        const framed = Buffer.allocUnsafe(2 + resp.length);
-                        framed.writeUInt16BE(resp.length, 0);
-                        resp.copy(framed, 2);
-                        socket.write(framed);
+                        socket.write(frameTcpResponse(resp));
                     })
                     .catch((e) => console.error(`[DNS Server] TCP query error from ${peer}: ${e?.message || e}`));
             }
