@@ -1,13 +1,16 @@
 # DevNS
 
-DevNS is a lightweight local DNS server for development purposes, it listens on UDP port 53 (configurable) and answers DNS queries by resolving them via Node's built-in `dns` module, with support for local hosts file overrides.
+DevNS is a lightweight local DNS server for development purposes, it listens on UDP and TCP port 53 (configurable) and answers DNS queries by resolving them via Node's built-in `dns` module, with support for local hosts file overrides.
 
 > DevNS is developed by AI. Also a [Tinkink](https://tink.ink) project.
 
 ## Features
 
 - **Lightweight & Fast**: Minimal dependencies, built on Node.js built-in modules
-- **UDP DNS Server**: Listens for DNS queries on configurable UDP port
+- **UDP & TCP DNS Server**: Listens for DNS queries on a configurable UDP and TCP port, with TCP fallback for large answers
+- **Web UI**: Tiny built-in UI to define your own fake DNS records, open by default
+- **Custom Records**: Serve A, AAAA, CNAME, MX, NS, PTR, SRV and TXT records you define
+- **Hosts Import**: Paste or upload a hosts file and turn it into A/AAAA records
 - **Hosts File Support**: Reads and watches system hosts file for local overrides
 - **Multiple Record Types**: Supports A, AAAA, CNAME, MX, NS, PTR, SRV, TXT, and ANY queries
 - **Standard Logging**: Clean console output with clear server status messages
@@ -42,10 +45,15 @@ npm run build
 devns [options]
 
 Options:
-  -p, --port <port>   UDP port to listen on (default: 53)
-  -H, --host <host>   Host/IP to bind (default: 0.0.0.0)
-  --ttl <seconds>     TTL for synthesized answers (default: 300)
-  -h, --help          Show help
+  -p, --port <port>       UDP/TCP port to listen on (default: 53)
+  -H, --host <host>       Host/IP to bind (default: 0.0.0.0)
+  --ttl <seconds>         TTL for synthesized answers (default: 300)
+  --web-port <port>       Web UI port (default: 5380)
+  --web-host <host>       Web UI bind host (default: 127.0.0.1)
+  --records <path>        Records JSON file (default: ~/.devns/records.json)
+  --no-web                Disable the web UI
+  --no-open               Do not open the browser automatically
+  -h, --help              Show help
 ```
 
 ### Examples
@@ -94,6 +102,16 @@ npm run build
 npm start -- --port 1053
 ```
 
+### Testing
+
+The unit tests use the built-in Node.js test runner (via `tsx`) and cover the
+record store, hosts import, TXT character-string splitting, EDNS(0)
+negotiation, UDP truncation and DNS-over-TCP framing:
+
+```bash
+npm test
+```
+
 ## Supported DNS Record Types
 
 The server supports the following DNS query types:
@@ -117,10 +135,50 @@ The server automatically reads and watches your system's hosts file:
 
 Any entries in the hosts file will override external DNS resolution. The server watches for changes and reloads the hosts file automatically.
 
+## Web UI & Custom Records
+
+DevNS ships with a tiny web UI (on by default at http://127.0.0.1:5380) for defining your own fake DNS records. The browser opens automatically on startup; pass `--no-open` to prevent that or `--no-web` to disable the UI entirely.
+
+Records are shown and edited in a table with `Name`, `Type`, fields and `TTL` columns. Complex types expose each component as its own input, so you never need to remember the underlying format:
+
+| Type  | Fields                              | Example values                          |
+| ----- | ----------------------------------- | --------------------------------------- |
+| A     | Address                             | `10.0.0.5`                              |
+| AAAA  | Address                             | `2001:db8::1`                           |
+| CNAME | Target                              | `api.internal`                          |
+| NS    | Name server                         | `ns1.internal`                          |
+| PTR   | Target                              | `host.internal`                         |
+| MX    | Priority, Mail server               | `10`, `mail.internal`                   |
+| SRV   | Priority, Weight, Port, Target      | `10`, `60`, `5060`, `sip.internal`      |
+| TXT   | Text                                | `hello world`                           |
+
+DevNS composes these fields into the canonical record value when writing and parses the stored value back into fields when reading. The JSON file therefore stays in the standard space-separated form:
+
+```json
+{ "name": "dev.local", "type": "MX", "value": "10 mail.internal" }
+```
+
+Records saved with a pre-composed `value` (for example, hand-edited files) are still parsed into fields when loaded.
+
+Custom records take precedence over the hosts file and the system resolver. Wildcards are supported: a record named `*.dev.local` answers any single-or-multi-label subdomain such as `foo.dev.local`.
+
+Records are persisted to `~/.devns/records.json` (override with `--records <path>`). Edits to that file made outside the UI are picked up automatically.
+
+### Importing a hosts file
+
+Click **Import hosts** in the UI and paste (or choose) a `/etc/hosts`-style file. IPv4 entries become `A` records and IPv6 entries become `AAAA` records. The parsed records are added to the table so you can review them before saving.
+
+```
+127.0.0.1   api.dev.local web.dev.local
+::1         api.dev.local
+```
+
 ## Technical Details
 
-- **Protocol**: UDP (TCP not supported)
-- **Maximum Response Size**: 512 bytes (no EDNS support)
+- **Protocol**: UDP and TCP (RFC 7766), on the same port
+- **EDNS(0)**: Advertised UDP payload size is honored (up to 4096 bytes), so large TXT records such as DKIM keys fit without truncation
+- **TCP Fallback**: Answers too large for UDP are served over TCP with the standard 2-byte length prefix
+- **TXT Records**: Values longer than 255 bytes are split into multiple DNS character-strings automatically
 - **Recursive Resolver**: Sets RA flag and copies RD from requests
 - **Error Handling**: Returns appropriate DNS response codes (NXDOMAIN, SERVFAIL, etc.)
 - **Logging**: Clean console output with server status and query information
@@ -128,12 +186,12 @@ Any entries in the hosts file will override external DNS resolution. The server 
 ## Requirements
 
 - Node.js 16.0.0 or higher
-- UDP port access (port 53 for standard DNS, or any available port for development)
+- UDP and TCP port access (port 53 for standard DNS, or any available port for development)
 
 ## Security Notes
 
 - Running on port 53 requires elevated privileges (sudo/admin access)
-- The server only responds to UDP DNS queries and doesn't support TCP
+- The server responds to both UDP and TCP DNS queries on the same port
 - Hosts file entries take precedence over external DNS resolution
 - No authentication or access control - ensure proper firewall configuration
 
